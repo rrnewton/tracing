@@ -61,6 +61,8 @@
 //! - `late-events`: Uses synchronized Registry and EnvFilter scope storage
 //!   that remains available during thread-local destruction. This opt-in does
 //!   not extend dispatcher or formatter lifetimes and changes storage costs.
+//!   Threads that exit with unbalanced span entries retain their scope entries
+//!   until the subscriber is dropped; this retention is unbounded.
 //!   **Requires "registry" and "std"**.
 //! - `json`: Enables `fmt` support for JSON output. In JSON output, the ANSI
 //!   feature does nothing. **Requires "fmt" and "std"**.

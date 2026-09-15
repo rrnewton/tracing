@@ -356,6 +356,9 @@ impl Subscriber for Registry {
             spans.borrow_mut().pop(id);
         }
         #[cfg(feature = "late-events")]
+        // SpanStack::push marks only later entries of an ID as duplicates,
+        // and pop removes its last entry first. Every nonempty stack therefore
+        // has a nonduplicate entry visible to current().
         self.current_spans
             .update(|spans| spans.pop(id), |spans| spans.current().is_none());
     }
