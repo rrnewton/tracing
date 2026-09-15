@@ -9,16 +9,25 @@ mod builder;
 mod directive;
 mod field;
 
+#[cfg(feature = "late-events")]
+use crate::thread_scope::ThreadScopes;
 use crate::{
     filter::LevelFilter,
     layer::{Context, Layer},
     sync::RwLock,
 };
 use alloc::{fmt, str::FromStr, vec::Vec};
+#[cfg(not(feature = "late-events"))]
 use core::cell::RefCell;
 use directive::ParseError;
 use std::{collections::HashMap, env, error::Error};
+#[cfg(not(feature = "late-events"))]
 use thread_local::ThreadLocal;
+
+#[cfg(not(feature = "late-events"))]
+type Scope = ThreadLocal<RefCell<Vec<LevelFilter>>>;
+#[cfg(feature = "late-events")]
+type Scope = ThreadScopes<Vec<LevelFilter>>;
 use tracing_core::{
     callsite,
     field::Field,
@@ -202,7 +211,7 @@ pub struct EnvFilter {
     has_dynamics: bool,
     by_id: RwLock<HashMap<span::Id, directive::SpanMatcher>>,
     by_cs: RwLock<HashMap<callsite::Identifier, directive::CallsiteMatcher>>,
-    scope: ThreadLocal<RefCell<Vec<LevelFilter>>>,
+    scope: Scope,
     regex: bool,
 }
 
@@ -218,7 +227,7 @@ impl Clone for EnvFilter {
             has_dynamics: self.has_dynamics,
             by_id: RwLock::default(),
             by_cs: RwLock::default(),
-            scope: ThreadLocal::new(),
+            scope: Scope::default(),
             regex: self.regex,
         }
     }
@@ -515,6 +524,13 @@ impl EnvFilter {
                 }
             }
 
+            #[cfg(feature = "late-events")]
+            let enabled_by_scope = self.scope.read(|scope| {
+                scope
+                    .map(|scope| scope.iter().any(|filter| filter >= level))
+                    .unwrap_or(false)
+            });
+            #[cfg(not(feature = "late-events"))]
             let enabled_by_scope = {
                 let scope = self.scope.get_or_default().borrow();
                 for filter in &*scope {
@@ -583,7 +599,10 @@ impl EnvFilter {
         // that to allow changing the filter while a span is already entered.
         // But that might be much less efficient...
         if let Some(span) = try_lock!(self.by_id.read()).get(id) {
+            #[cfg(not(feature = "late-events"))]
             self.scope.get_or_default().borrow_mut().push(span.level());
+            #[cfg(feature = "late-events")]
+            self.scope.push(|scope| scope.push(span.level()));
         }
     }
 
@@ -594,7 +613,10 @@ impl EnvFilter {
     /// traits, but it does not require the trait to be in scope.
     pub fn on_exit<S>(&self, id: &span::Id, _: Context<'_, S>) {
         if self.cares_about_span(id) {
+            #[cfg(not(feature = "late-events"))]
             self.scope.get_or_default().borrow_mut().pop();
+            #[cfg(feature = "late-events")]
+            self.scope.update(Vec::pop, Vec::is_empty);
         }
     }
 
@@ -841,6 +863,40 @@ mod tests {
     use std::println;
     use tracing_core::field::FieldSet;
     use tracing_core::*;
+
+    #[cfg(feature = "late-events")]
+    #[test]
+    fn balanced_threads_remove_registry_and_filter_scopes() {
+        use crate::prelude::*;
+        let dispatch = tracing::Dispatch::new(
+            crate::Registry::default().with(EnvFilter::new("off,[watched{owner=7}]=info")),
+        );
+        for _ in 0..128 {
+            let thread_dispatch = dispatch.clone();
+            std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&thread_dispatch, || {
+                    let span = tracing::info_span!("watched", owner = 7u64);
+                    let first = span.enter();
+                    let second = span.enter();
+                    tracing::info!("inside duplicate entered scope");
+                    drop(first);
+                    drop(second);
+                });
+            })
+            .join()
+            .unwrap();
+        }
+        assert_eq!(
+            dispatch
+                .downcast_ref::<crate::Registry>()
+                .unwrap()
+                .current_scope_count(),
+            0
+        );
+        let filter = dispatch.downcast_ref::<EnvFilter>().unwrap();
+        assert_eq!(filter.scope.len(), 0);
+        assert!(filter.by_id.read().unwrap().is_empty());
+    }
 
     struct NoSubscriber;
     impl Subscriber for NoSubscriber {
