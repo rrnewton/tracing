@@ -507,23 +507,27 @@ impl EnvFilter {
     pub fn enabled<S>(&self, metadata: &Metadata<'_>, _: Context<'_, S>) -> bool {
         let level = metadata.level();
 
+        if self.has_dynamics && metadata.is_span() {
+            let registered = self
+                .by_cs
+                .read()
+                .ok()
+                .map(|by_cs| by_cs.contains_key(&metadata.callsite()));
+            // Another thread may still be registering this callsite. A missing
+            // cache entry does not mean the span cannot influence filtering.
+            // Like register_callsite, enable matching spans even when their
+            // own level is more verbose than the events they enable.
+            if registered == Some(true)
+                || (registered == Some(false) && self.dynamics.matcher(metadata).is_some())
+            {
+                return true;
+            }
+        }
+
         // is it possible for a dynamic filter directive to enable this event?
         // if not, we can avoid the thread local access + iterating over the
         // spans in the current scope.
         if self.has_dynamics && self.dynamics.max_level >= *level {
-            if metadata.is_span() {
-                // If the metadata is a span, see if we care about its callsite.
-                let enabled_by_cs = self
-                    .by_cs
-                    .read()
-                    .ok()
-                    .map(|by_cs| by_cs.contains_key(&metadata.callsite()))
-                    .unwrap_or(false);
-                if enabled_by_cs {
-                    return true;
-                }
-            }
-
             #[cfg(feature = "late-events")]
             let enabled_by_scope = self.scope.read(|scope| {
                 scope
@@ -582,9 +586,20 @@ impl EnvFilter {
     /// [`Filter::on_new_span`] methods on `EnvFilter`'s implementations of those
     /// traits, but it does not require the trait to be in scope.
     pub fn on_new_span<S>(&self, attrs: &span::Attributes<'_>, id: &span::Id, _: Context<'_, S>) {
-        let by_cs = try_lock!(self.by_cs.read());
-        if let Some(cs) = by_cs.get(&attrs.metadata().callsite()) {
-            let span = cs.to_span_match(attrs);
+        let span = {
+            let by_cs = try_lock!(self.by_cs.read());
+            by_cs
+                .get(&attrs.metadata().callsite())
+                .map(|cs| cs.to_span_match(attrs))
+        };
+        // enabled can admit the span before register_callsite reaches this
+        // filter. Build the same matcher from metadata in that case, so initial
+        // values and later updates have their ordinary filtering behavior.
+        if let Some(span) = span.or_else(|| {
+            self.dynamics
+                .matcher(attrs.metadata())
+                .map(|cs| cs.to_span_match(attrs))
+        }) {
             try_lock!(self.by_id.write()).insert(id.clone(), span);
         }
     }
