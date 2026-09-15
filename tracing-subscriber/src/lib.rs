@@ -58,6 +58,10 @@
 //!   default.
 //! - `registry`: enables the [`registry`] module. Enabled by default.
 //!   **Requires "std"**.
+//! - `late-events`: Uses synchronized Registry and EnvFilter scope storage
+//!   that remains available during thread-local destruction. This opt-in does
+//!   not extend dispatcher or formatter lifetimes and changes storage costs.
+//!   **Requires "registry" and "std"**.
 //! - `json`: Enables `fmt` support for JSON output. In JSON output, the ANSI
 //!   feature does nothing. **Requires "fmt" and "std"**.
 //! - `local-time`: Enables local time formatting when using the [`time`
@@ -220,6 +224,9 @@ pub mod registry;
 
 pub mod layer;
 pub mod util;
+
+#[cfg(feature = "late-events")]
+mod thread_scope;
 
 feature! {
     #![feature = "std"]

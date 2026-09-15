@@ -1104,7 +1104,7 @@ impl fmt::Debug for MockLayer {
         }
 
         if let Ok(current) = self.current.try_lock() {
-            s.field("current", &format_args!("{:?}", &current));
+            s.field("current", &format_args!("{:?}", current));
         } else {
             s.field("current", &format_args!("<locked>"));
         }

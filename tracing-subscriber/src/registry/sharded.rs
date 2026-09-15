@@ -1,5 +1,19 @@
-use sharded_slab::{pool::Ref, Clear, Pool};
+use sharded_slab::Clear;
+#[cfg(not(feature = "late-events"))]
+use sharded_slab::{pool::Ref, Pool};
+#[cfg(not(feature = "late-events"))]
 use thread_local::ThreadLocal;
+#[cfg(feature = "late-events")]
+#[path = "owned.rs"]
+mod owned;
+#[cfg(feature = "late-events")]
+use self::owned::{Pool, Ref};
+#[cfg(feature = "late-events")]
+use crate::thread_scope::ThreadScopes;
+#[cfg(feature = "late-events")]
+use alloc::vec::Vec;
+#[cfg(not(feature = "late-events"))]
+use core::cell::{self, RefCell};
 
 use super::stack::SpanStack;
 use crate::{
@@ -11,7 +25,7 @@ use crate::{
     sync::RwLock,
 };
 use core::{
-    cell::{self, Cell, RefCell},
+    cell::Cell,
     sync::atomic::{fence, AtomicUsize, Ordering},
 };
 use std::thread_local;
@@ -35,8 +49,11 @@ use tracing_core::{
 /// allows [`Layer`]-specific data to benefit from the `Registry`'s
 /// high-performance concurrent storage.
 ///
-/// This registry is implemented using a [lock-free sharded slab][slab], and is
-/// highly optimized for concurrent access.
+/// By default, this registry uses a [lock-free sharded slab][slab] optimized
+/// for concurrent access. The opt-in `late-events` feature instead uses
+/// synchronized span and entered-scope stores that remain available during
+/// thread-local destruction. It does not change dispatcher or formatter
+/// lifetimes and has different synchronization and allocation costs.
 ///
 /// # Span ID Generation
 ///
@@ -51,8 +68,10 @@ use tracing_core::{
 /// The registry's span IDs are guaranteed to be unique **at a given point
 /// in time**. This means that an active span will never be assigned the
 /// same ID as another **currently active** span. However, the registry
-/// **will** eventually reuse the IDs of [closed] spans, although an ID
-/// will never be reassigned immediately after a span has closed.
+/// **will** eventually reuse the IDs of [closed] spans in its default storage,
+/// although an ID will never be reassigned immediately after a span has closed.
+/// With `late-events`, IDs are not reused; allocation refuses exhaustion rather
+/// than wrapping into an existing or zero ID.
 ///
 /// Spans are not [considered closed] by the `Registry` until *every*
 /// [`Span`] reference with that ID has been dropped.
@@ -92,7 +111,10 @@ use tracing_core::{
 #[derive(Debug)]
 pub struct Registry {
     spans: Pool<DataInner>,
+    #[cfg(not(feature = "late-events"))]
     current_spans: ThreadLocal<RefCell<SpanStack>>,
+    #[cfg(feature = "late-events")]
+    current_spans: ThreadScopes<SpanStack>,
     next_filter_id: u8,
 }
 
@@ -109,17 +131,17 @@ pub struct Registry {
 #[cfg_attr(docsrs, doc(cfg(all(feature = "registry", feature = "std"))))]
 #[derive(Debug)]
 pub struct Data<'a> {
-    /// Immutable reference to the pooled `DataInner` entry.
+    /// Immutable reference to the stored `DataInner` entry.
     inner: Ref<'a, DataInner>,
 }
 
 /// Stored data associated with a span.
 ///
-/// This type is pooled using [`sharded_slab::Pool`]; when a span is
-/// dropped, the `DataInner` entry at that span's slab index is cleared
-/// in place and reused by a future span. Thus, the `Default` and
-/// [`sharded_slab::Clear`] implementations for this type are
-/// load-bearing.
+/// Default storage pools this type using [`sharded_slab::Pool`]. The
+/// `late-events` store retains retired data until all internal references
+/// finish. Both stores run [`sharded_slab::Clear`] after normal span closure;
+/// whole-store destruction drops remaining values without parent-close calls.
+/// The `Default` and `Clear` implementations are load-bearing.
 #[derive(Debug)]
 struct DataInner {
     filter_map: FilterMap,
@@ -127,7 +149,7 @@ struct DataInner {
     parent: Option<Id>,
     ref_count: AtomicUsize,
     // The span's `Extensions` typemap. Allocations for the `HashMap` backing
-    // this are pooled and reused in place.
+    // this are pooled and reused in place by default storage.
     pub(crate) extensions: RwLock<ExtensionsInner>,
 }
 
@@ -137,7 +159,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             spans: Pool::new(),
-            current_spans: ThreadLocal::new(),
+            current_spans: Default::default(),
             next_filter_id: 0,
         }
     }
@@ -205,8 +227,23 @@ impl Registry {
         self.next_filter_id > 0
     }
 
+    #[cfg(all(test, feature = "late-events"))]
+    pub(crate) fn current_scope_count(&self) -> usize {
+        self.current_spans.len()
+    }
+
+    #[cfg(not(feature = "late-events"))]
     pub(crate) fn span_stack(&self) -> cell::Ref<'_, SpanStack> {
         self.current_spans.get_or_default().borrow()
+    }
+
+    #[cfg(feature = "late-events")]
+    pub(crate) fn span_stack(&self) -> Vec<Id> {
+        self.current_spans.read(|spans| {
+            spans
+                .map(|spans| spans.iter().cloned().collect())
+                .unwrap_or_default()
+        })
     }
 }
 
@@ -236,23 +273,29 @@ impl Subscriber for Registry {
 
     #[inline]
     fn new_span(&self, attrs: &span::Attributes<'_>) -> span::Id {
-        let parent = if attrs.is_root() {
-            None
-        } else if attrs.is_contextual() {
-            self.current_span().id().map(|id| self.clone_span(id))
-        } else {
-            attrs.parent().map(|id| self.clone_span(id))
+        let parent = || {
+            if attrs.is_root() {
+                None
+            } else if attrs.is_contextual() {
+                self.current_span().id().map(|id| self.clone_span(id))
+            } else {
+                attrs.parent().map(|id| self.clone_span(id))
+            }
         };
+        #[cfg(not(feature = "late-events"))]
+        let parent = parent();
 
         let id = self
             .spans
-            // Check out a `DataInner` entry from the pool for the new span. If
-            // there are free entries already allocated in the pool, this will
-            // preferentially reuse one; otherwise, a new `DataInner` is
-            // allocated and added to the pool.
+            // Default storage checks out a reusable pooled DataInner. The
+            // late-events store reserves a fresh identity and initializes new
+            // owned data before publishing it in the span map.
             .create_with(|data| {
                 data.metadata = attrs.metadata();
-                data.parent = parent;
+                #[cfg(not(feature = "late-events"))]
+                {
+                    data.parent = parent;
+                }
                 data.filter_map = crate::filter::FILTERING.with(|filtering| filtering.filter_map());
                 #[cfg(debug_assertions)]
                 {
@@ -264,6 +307,16 @@ impl Subscriber for Registry {
                 let refs = data.ref_count.get_mut();
                 debug_assert_eq!(*refs, 0);
                 *refs = 1;
+                #[cfg(feature = "late-events")]
+                {
+                    // The owned store reserves an ID before initialization.
+                    // Retain the parent last, after allocation can refuse and
+                    // initialization checks can panic. Retrieving the current
+                    // Dispatch during new_span may return the reentry default,
+                    // so a failed allocation cannot safely close a parent via
+                    // a guard that attempts to retrieve that Dispatch.
+                    data.parent = parent();
+                }
             })
             .expect("Unable to allocate another span");
         idx_to_id(id)
@@ -288,16 +341,23 @@ impl Subscriber for Registry {
     fn event(&self, _: &Event<'_>) {}
 
     fn enter(&self, id: &span::Id) {
+        #[cfg(not(feature = "late-events"))]
         self.current_spans
             .get_or_default()
             .borrow_mut()
             .push(id.clone());
+        #[cfg(feature = "late-events")]
+        self.current_spans.push(|spans| spans.push(id.clone()));
     }
 
     fn exit(&self, id: &span::Id) {
+        #[cfg(not(feature = "late-events"))]
         if let Some(spans) = self.current_spans.get() {
             spans.borrow_mut().pop(id);
         }
+        #[cfg(feature = "late-events")]
+        self.current_spans
+            .update(|spans| spans.pop(id), |spans| spans.current().is_none());
     }
 
     fn clone_span(&self, id: &span::Id) -> span::Id {
@@ -323,6 +383,15 @@ impl Subscriber for Registry {
     }
 
     fn current_span(&self) -> Current {
+        #[cfg(feature = "late-events")]
+        {
+            let id = self
+                .current_spans
+                .read(|spans| spans.and_then(|spans| spans.current()).cloned());
+            id.and_then(|id| self.get(&id).map(|span| Current::new(id, span.metadata)))
+                .unwrap_or_else(Current::none)
+        }
+        #[cfg(not(feature = "late-events"))]
         self.current_spans
             .get()
             .and_then(|spans| {
@@ -551,6 +620,32 @@ mod tests {
             dbg!(format_args!("closing {:?}", id));
             assert!(&ctx.span(&id).is_some());
         }
+    }
+
+    #[cfg(feature = "late-events")]
+    #[test]
+    fn refused_span_allocation_releases_retained_parent() {
+        let (close_layer, state) = CloseLayer::new();
+        let dispatch = dispatcher::Dispatch::new(close_layer.with_subscriber(Registry::default()));
+        dispatcher::with_default(&dispatch, || {
+            let parent = tracing::info_span!("parent");
+            let registry = dispatch.downcast_ref::<Registry>().unwrap();
+            registry.spans.exhaust_for_test();
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracing::info_span!(parent: &parent, "refused_child");
+            }))
+            .is_err());
+            assert_eq!(
+                registry
+                    .get(&parent.id().unwrap())
+                    .unwrap()
+                    .ref_count
+                    .load(Ordering::Relaxed),
+                1
+            );
+            drop(parent);
+            state.assert_removed("parent");
+        });
     }
 
     #[test]

@@ -9,7 +9,6 @@ use alloc::{
     vec::Vec,
 };
 use std::{env, eprintln};
-use thread_local::ThreadLocal;
 use tracing::level_filters::STATIC_MAX_LEVEL;
 
 /// A [builder] for constructing new [`EnvFilter`]s.
@@ -327,7 +326,7 @@ impl Builder {
             has_dynamics,
             by_id: RwLock::new(Default::default()),
             by_cs: RwLock::new(Default::default()),
-            scope: ThreadLocal::new(),
+            scope: Default::default(),
             regex: self.regex,
         };
 
