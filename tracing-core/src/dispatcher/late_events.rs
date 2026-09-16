@@ -8,9 +8,28 @@ use core::{fmt, marker::PhantomData, mem, sync::atomic::Ordering};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::{atomic::AtomicUsize, Mutex, MutexGuard},
+    sync::atomic::AtomicUsize,
     vec::Vec,
 };
+
+#[cfg(all(
+    feature = "late-events-fork",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(super) mod fork;
+#[cfg(all(
+    feature = "late-events-fork",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+use fork::{Store as Mutex, StoreGuard as MutexGuard};
+#[cfg(not(all(
+    feature = "late-events-fork",
+    target_os = "linux",
+    target_arch = "x86_64"
+)))]
+use std::sync::{Mutex, MutexGuard};
 
 /// Owns the obligation to finalize this thread's registered dispatcher state.
 ///

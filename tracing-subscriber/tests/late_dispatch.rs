@@ -417,3 +417,11 @@ fn registered_late_updates_keep_typed_filters_context_and_log_metadata() {
         b" INFO watched{owner=7 owner=8}: host_record: retained value=11 answer=\"stable\"\n"
     );
 }
+
+#[cfg(all(
+    feature = "late-events-fork",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[path = "late_dispatch/fork.rs"]
+mod fork;

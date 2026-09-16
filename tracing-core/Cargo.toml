@@ -29,6 +29,8 @@ default = ["std", "valuable?/std"]
 std = []
 # Explicitly registered dispatcher state may outlive ordinary thread-local destructors.
 late-events = ["std"]
+# Explicit physical-fork preparation/completion for Linux x86-64.
+late-events-fork = ["late-events"]
 # used to be an implicit feature from an optional dependency
 # FIXME: remove with the next breaking-change release
 once_cell = []

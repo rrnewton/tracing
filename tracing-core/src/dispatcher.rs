@@ -127,6 +127,17 @@ use core::ptr::addr_of;
 
 #[cfg(feature = "late-events")]
 mod late_events;
+
+#[cfg(all(
+    feature = "late-events-fork",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub use late_events::fork::{
+    current_fork_failure, current_fork_inheritance, prepare_fork, ForkFailure, ForkInheritance,
+    ForkPreparation, ForkPrepareError,
+};
+
 #[cfg(feature = "late-events")]
 pub use self::late_events::{
     current_thread_failure, finalize_current_thread, register_current_thread, FinalizeError,
