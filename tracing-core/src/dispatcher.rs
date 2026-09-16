@@ -125,6 +125,14 @@
 
 use core::ptr::addr_of;
 
+#[cfg(feature = "late-events")]
+mod late_events;
+#[cfg(feature = "late-events")]
+pub use self::late_events::{
+    current_thread_failure, finalize_current_thread, register_current_thread, FinalizeError,
+    FinalizeRefusal, FinalizedThread, RegistrationError, ThreadFailure, ThreadRegistration,
+};
+
 use crate::{
     callsite, span,
     subscriber::{self, NoSubscriber, Subscriber},
@@ -376,14 +384,27 @@ impl SetGlobalDefaultError {
 ///
 /// [dispatcher]: super::dispatcher::Dispatch
 #[cfg(feature = "std")]
-pub fn get_default<T, F>(mut f: F) -> T
+pub fn get_default<T, F>(f: F) -> T
 where
     F: FnMut(&Dispatch) -> T,
 {
+    #[cfg(feature = "late-events")]
+    return late_events::with_activity(move || get_default_inner(f));
+    #[cfg(not(feature = "late-events"))]
+    get_default_inner(f)
+}
+
+#[cfg(feature = "std")]
+fn get_default_inner<T>(mut f: impl FnMut(&Dispatch) -> T) -> T {
     if SCOPED_COUNT.load(Ordering::Acquire) == 0 {
         // fast path if no scoped dispatcher has been set; just use the global
         // default.
         return f(get_global());
+    }
+
+    #[cfg(feature = "late-events")]
+    if late_events::registered() {
+        return late_events::get_scoped_default(f);
     }
 
     CURRENT_STATE
@@ -408,10 +429,23 @@ where
 #[doc(hidden)]
 #[inline(never)]
 pub fn get_current<T>(f: impl FnOnce(&Dispatch) -> T) -> Option<T> {
+    #[cfg(feature = "late-events")]
+    return late_events::with_activity(move || get_current_inner(f));
+    #[cfg(not(feature = "late-events"))]
+    get_current_inner(f)
+}
+
+#[cfg(feature = "std")]
+fn get_current_inner<T>(f: impl FnOnce(&Dispatch) -> T) -> Option<T> {
     if SCOPED_COUNT.load(Ordering::Acquire) == 0 {
         // fast path if no scoped dispatcher has been set; just use the global
         // default.
         return Some(f(get_global()));
+    }
+
+    #[cfg(feature = "late-events")]
+    if late_events::registered() {
+        return late_events::get_scoped_current(f);
     }
 
     CURRENT_STATE
@@ -839,6 +873,10 @@ impl State {
     /// the previous value.
     #[inline]
     fn set_default(new_dispatch: Dispatch) -> DefaultGuard {
+        #[cfg(feature = "late-events")]
+        if late_events::registered() {
+            return late_events::set_default(new_dispatch);
+        }
         let prior = CURRENT_STATE
             .try_with(|state| {
                 state.can_enter.set(true);
@@ -889,6 +927,11 @@ impl Drop for Entered<'_> {
 impl Drop for DefaultGuard {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(feature = "late-events")]
+        if late_events::registered() {
+            late_events::restore(self);
+            return;
+        }
         // Replace the dispatcher and then drop the old one outside
         // of the thread-local context. Dropping the dispatch may
         // lead to the drop of a subscriber which, in the process,

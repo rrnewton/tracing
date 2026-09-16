@@ -27,6 +27,8 @@ rust-version = "1.65.0"
 [features]
 default = ["std", "valuable?/std"]
 std = []
+# Explicitly registered dispatcher state may outlive ordinary thread-local destructors.
+late-events = ["std"]
 # used to be an implicit feature from an optional dependency
 # FIXME: remove with the next breaking-change release
 once_cell = []
