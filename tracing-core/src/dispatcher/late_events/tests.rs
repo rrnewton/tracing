@@ -24,6 +24,12 @@ struct Allocator;
 static ALLOCATOR: Allocator = Allocator;
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(all(
+            feature = "late-events-fork",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        fork::observe_allocation();
         let action = ALLOC_ACTION.try_with(Cell::take).ok().flatten();
         if action.map(|f| f()).unwrap_or(false) {
             core::ptr::null_mut()
@@ -32,6 +38,12 @@ unsafe impl GlobalAlloc for Allocator {
         }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(all(
+            feature = "late-events-fork",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        fork::observe_deallocation();
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -660,3 +672,10 @@ fn last_temporary_dispatch_drops_after_reader_release_but_during_activity() {
         },
     );
 }
+
+#[cfg(all(
+    feature = "late-events-fork",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(super) mod fork;

@@ -33,6 +33,7 @@ ansi = ["fmt", "nu-ansi-term"]
 registry = ["sharded-slab", "thread_local", "std"]
 # Keep Registry and EnvFilter storage available during thread-local destruction.
 late-events = ["registry", "std", "tracing-core/late-events"]
+late-events-fork = ["late-events", "tracing-core/late-events-fork"]
 json = ["tracing-serde", "serde", "serde_json"]
 valuable = ["tracing-core/valuable", "valuable_crate", "valuable-serde", "tracing-serde/valuable"]
 # Enables support for local time when using the `time` crate timestamp
